@@ -10,6 +10,9 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./github-actions-fastapi
 
     steps:
       - name: Checkout code
@@ -24,7 +27,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/.cache/pypoetry
-          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lockk') }}
+          key: ${{ runner.os }}-poetry-${{ hashFiles('github-actions-fastapi/poetry.lock') }}
           restore-keys: |
             ${{ runner.os }}-poetry-
       
