@@ -58,10 +58,74 @@ jobs:
     needs: test
     if: github.event_name == 'push'
 
+    outputs:
+      image-ghcr: ${{ steps.image-output.outputs.ghcr-image }}
+      image-ecr: ${{ steps.image-output.outputs.ecr-image }}
+      has-aws: ${{ steps.check-aws.outputs.configured }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # AWS Verification
+      - name: Check AWS credentials
+        id: check-aws-creds
+        run: |
+          if [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && \
+            [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && \
+            [ -n "${{ secrets.AWS_REGION }}" ]; then
+            echo "has-credentials=true" >> $GITHUB_OUTPUT
+            echo "✅ AWS credentials found"
+          else
+            echo "has-credentials=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ AWS credentials not configured - skipping ECR"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check-aws-creds.outputs.has-credentials == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check if ECR repository exists
+        if: steps.check-aws-creds.outputs.has-credentials == 'true'
+        id: check-ecr
+        continue-on-error: true
+        run: |
+          if aws ecr describe-repositories \
+              --repository-names fastapi-cicd \
+              --region ${{ secrets.AWS_REGION }} > /dev/null 2>&1; then
+            echo "repository-exists=true" >> $GITHUB_OUTPUT
+            echo "✅ ECR repository 'fastapi-cicd' exists"
+          else
+            echo "repository-exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ ECR repository 'fastapi-cicd' not found"
+          fi
+
+      - name: Set AWS availability flag
+        id: check-aws
+        run: |
+          HAS_CREDS="${{ steps.check-aws-creds.outputs.has-credentials }}"
+          HAS_REPO="${{ steps.check-ecr.outputs.repository-exists }}"
+          
+          if [ "$HAS_CREDS" == "true" ] && [ "$HAS_REPO" == "true" ]; then
+            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "🚀 AWS ECR fully configured - will push to ECR"
+          else
+            echo "configured=false" >> $GITHUB_OUTPUT
+            
+            if [ "$HAS_CREDS" != "true" ]; then
+              echo "ℹ️ Skipping ECR: AWS credentials not configured"
+            elif [ "$HAS_REPO" != "true" ]; then
+              echo "ℹ️ Skipping ECR: Repository 'fastapi-cicd' does not exist"
+              echo "   Create it with: aws ecr create-repository --repository-name fastapi-cicd"
+            fi
+          fi
+
+
+      # Docker Build Setup
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -100,3 +164,50 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # AWS ECR
+      - name: Login to Amazon ECR
+        if: steps.check-aws.outputs.configured == 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata for ECR
+        if: steps.check-aws.outputs.configured == 'true'
+        id: meta-ecr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/fastapi-cicd
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push to ECR
+        if: steps.check-aws.outputs.configured == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./github-actions-fastapi
+          file: ./github-actions-fastapi/Dockerfile
+          push: true
+          tags: ${{ steps.meta-ecr.outputs.tags }}
+          labels: ${{ steps.meta-ecr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image URIs
+        id: image-output
+        run: |
+          # GHCR image (always available)
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/fastapi-cicd:sha-${GITHUB_SHA::7}"
+          echo "ghcr-image=$GHCR_IMAGE" >> $GITHUB_OUTPUT
+          echo "📦 GHCR Image: $GHCR_IMAGE"
+          
+          # ECR image (only if AWS configured)
+          if [ "${{ steps.check-aws.outputs.configured }}" == "true" ]; then
+            ECR_IMAGE="${{ steps.login-ecr.outputs.registry }}/fastapi-cicd:sha-${GITHUB_SHA::7}"
+            echo "ecr-image=$ECR_IMAGE" >> $GITHUB_OUTPUT
+            echo "📦 ECR Image: $ECR_IMAGE"
+          else
+            echo "ecr-image=" >> $GITHUB_OUTPUT
+            echo "ℹ️ ECR push skipped"
+          fi
